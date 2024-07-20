@@ -511,40 +511,56 @@ def model_reinit_schedule(
     
     #Hardness of reset dependent on current performance
     #Resetting
-    
-    #cpu = jax.devices('cpu')[0]
-    #optimizer_state_on_cpu = jax.device_put(optimizer_state, device=cpu)
-    reset_factor = (workload.validation_target_value - schedule_params["reset_metric"]["metric"]) / workload.validation_target_value
-    
+     gpu_devices = [device for device in jax.devices() if device.platform == 'gpu']
+    if len(gpu_devices) > 1:
+      device1 = jax.devices('gpu')[0]
+      device2= jax.devices('gpu')[1]
+    else:
+      device1 = jax.devices('cpu')[0]
+      device2 = jax.devices('cpu')[0]
+    reset_factor = max((workload.validation_target_value - schedule_params["reset_metric"]["metric"]) / workload.validation_target_value, 0)
     count = optimizer_state[0].count
+    mu = jax.device_put(optimizer_state[0].mu, device=device1)
+    nu = jax.device_put(optimizer_state[0].nu, device=device2)
+    optimizer_state_sec = optimizer_state[2] 
+    del optimizer_state
+    gc.collect()
     #refactor
     @jax.jit
     def rescale_momentum(reset_factor, momentum, alpha):
       momentum = jax.tree_util.tree_map(lambda x: (1-reset_factor*alpha)*x, momentum)
       return momentum
     
-    mu = rescale_momentum(reset_factor, optimizer_state[0].mu, alpha)
-    new_optimizer_state = (reinit_optimizer_state[0]._replace(count=count, mu=mu), reinit_optimizer_state[1], optimizer_state[2])
+    rescaled_mu = rescale_momentum(reset_factor, mu, alpha)
+    new_optimizer_state = (reinit_optimizer_state[0]._replace(count=count, mu=rescaled_mu), reinit_optimizer_state[1], optimizer_state_sec)
     del mu
-    optimizer_state[0].mu = None
+    del rescaled_mu
     gc.collect()
-    nu = rescale_momentum(reset_factor, optimizer_state[0].nu, alpha)
-    new_optimizer_state = (reinit_optimizer_state[0]._replace(count=count, nu=nu), reinit_optimizer_state[1], optimizer_state[2])
+    rescaled_nu = rescale_momentum(reset_factor, nu, alpha)
+    new_optimizer_state = (reinit_optimizer_state[0]._replace(count=count, nu=rescaled_nu), reinit_optimizer_state[1], optimizer_state_sec)
     del nu
-    del optimizer_state
+    del rescaled_nu
     gc.collect()
     #full reset
-    #new_optimizer_state = (reinit_optimizer_state[0]._replace(count=count), reinit_optimizer_state[1], optimizer_state[2])
+  
+    @jax.jit
+    def rescale_model_params(new_params, model_params, reset_factor):
+      model_params = jax.tree_util.tree_map(lambda x: (1-reset_factor)*x, model_params)
+      new_params = jax.tree_util.tree_map(lambda x: reset_factor*x, new_params)
+      new_params = jax.tree_util.tree_map(lambda x,y: (reset_factor*x) + ((1-reset_factor)*y), new_params, model_params) 
+      return new_params
+    
     new_params, _ = workload.init_model_fn(rng, dropout_rate=hyperparameters["dropout_rate"])
-    model_params = jax.tree_util.tree_map(lambda x: (1-reset_factor)*x, model_params)
-    new_params = jax.tree_util.tree_map(lambda x: reset_factor*x, new_params)
-    new_params = jax.tree_util.tree_map(lambda x,y: x+y, new_params, model_params) 
+    new_params = rescale_model_params(new_params, model_params, reset_factor)
+    
+    del model_params
+    gc.collect()
     schedule_params["stop_metric"] = {"evaluate" :False, "metrics": [], "global_min": [0, np.inf]}
       
 
-    #with open('/experiment_runs/early_stop_reinits2.csv', 'a', newline='') as file:
-    #    writer = csv.writer(file)
-    #    writer.writerow([global_step, reset_factor,schedule_params['num_early_stops'], GRAPH["counter"]])  # Writing the number as a single-element list
+    with open('/experiment_runs/refactor2.csv', 'a', newline='') as file:
+       writer = csv.writer(file)
+       writer.writerow([global_step, reset_factor,schedule_params['num_early_stops'], GRAPH["counter"]])  # Writing the number as a single-element list
     #with open('/experiment_runs/early_stop_vlosses2.csv', 'a', newline='') as file:
     #    writer = csv.writer(file)
     #    writer.writerow(schedule_params['stop_metric']['metrics'])
@@ -553,7 +569,6 @@ def model_reinit_schedule(
     new_params = model_params
     new_optimizer_state = optimizer_state
     update_sp = False
-
   return new_params, new_optimizer_state, schedule_params, update_sp
 
 
